@@ -1,3 +1,5 @@
+![the collective compression algorithm reference](theCollective.png)
+
 vencord/equicord plugin to autocompress media files to fit discord upload limit. works using ffmpeg on path.
 
 # how to use
