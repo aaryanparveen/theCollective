@@ -1,15 +1,18 @@
 import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { findByPropsLazy } from "@webpack";
+import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { Alerts, ChannelStore, DraftType, FluxDispatcher, SelectedChannelStore, showToast, Toasts, UploadHandler, UserStore } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.TheCollective as PluginNative<typeof import("./native")>;
 
 const logger = new Logger("TheCollective");
 const { getUserMaxFileSize } = findByPropsLazy("getUserMaxFileSize");
+const getGuildAwareMaxFileSize = findByCodeLazy("getUserMaxFileSize(", "getGuildMaxFileSize") as undefined | ((guildId: string | null) => number);
 
 let interceptor: ((event: any) => void) | null = null;
+let pasteHandler: ((e: ClipboardEvent) => void) | null = null;
+let dropHandler: ((e: DragEvent) => void) | null = null;
 const ours = new WeakSet<File>();
 
 function isCompressible(file: File): boolean {
@@ -183,6 +186,56 @@ function onDispatch(event: any) {
     }
 }
 
+function resolveLimit(channelId: string): number {
+    try {
+        if (typeof getGuildAwareMaxFileSize === "function") {
+            const guildId = ChannelStore.getChannel(channelId)?.guild_id ?? null;
+            const v = getGuildAwareMaxFileSize(guildId);
+            if (Number.isFinite(v) && v > 0) return v;
+        }
+    } catch (e) {
+        logger.error("resolveLimit error", e);
+    }
+    const base = getUserMaxFileSize?.(UserStore.getCurrentUser());
+    return Number.isFinite(base) ? base : 0;
+}
+
+function handleDomFiles(e: Event, files: File[]) {
+    if (!files.length) return;
+
+    const channelId = SelectedChannelStore.getChannelId();
+    if (!channelId) return;
+
+    const limit = resolveLimit(channelId);
+    if (!limit) return;
+
+    const toCompress = files.filter(f => !ours.has(f) && f.size > limit && isCompressible(f));
+    if (!toCompress.length) return;
+
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    const passThrough = files.filter(f => !toCompress.includes(f));
+    if (passThrough.length) addToDraft(channelId, passThrough);
+    void compressAndAdd(toCompress, limit, channelId);
+}
+
+function onPaste(e: ClipboardEvent) {
+    try {
+        handleDomFiles(e, Array.from(e.clipboardData?.files ?? []));
+    } catch (err) {
+        logger.error("paste handler error", err);
+    }
+}
+
+function onDrop(e: DragEvent) {
+    try {
+        handleDomFiles(e, Array.from(e.dataTransfer?.files ?? []));
+    } catch (err) {
+        logger.error("drop handler error", err);
+    }
+}
+
 export default definePlugin({
     name: "TheCollective",
     description: "auto-compresses audio and video files down to fit discord's upload limit instead of blocking it. requires ffmpeg on PATH.",
@@ -191,9 +244,9 @@ export default definePlugin({
 
     patches: [
         {
-            find: "#{intl::tRuxk9::raw}",
+            find: "getGuildMaxFileSize",
             replacement: {
-                match: /(?<=MAX_FILE_SIZE_250_MB.{0,250})Array\.from\((\i)\)\.some/,
+                match: /Array\.from\((\i)\)\.some\(\i=>\i\.size>/g,
                 replace: "$self.bypassSizeCheck($1)?false:$&"
             }
         }
@@ -212,9 +265,19 @@ export default definePlugin({
     },
 
     async start() {
-        if (interceptor) return;
-        interceptor = onDispatch;
-        FluxDispatcher.addInterceptor(interceptor);
+        if (!interceptor) {
+            interceptor = onDispatch;
+            FluxDispatcher.addInterceptor(interceptor);
+        }
+
+        if (!pasteHandler) {
+            pasteHandler = onPaste;
+            document.addEventListener("paste", pasteHandler, true);
+        }
+        if (!dropHandler) {
+            dropHandler = onDrop;
+            document.addEventListener("drop", dropHandler, true);
+        }
 
         try {
             if (!(await Native.ffmpegAvailable()))
@@ -223,10 +286,20 @@ export default definePlugin({
     },
 
     stop() {
-        if (!interceptor) return;
-        const list = (FluxDispatcher as any)._interceptors;
-        const i = list?.indexOf(interceptor);
-        if (i > -1) list.splice(i, 1);
-        interceptor = null;
+        if (interceptor) {
+            const list = (FluxDispatcher as any)._interceptors;
+            const i = list?.indexOf(interceptor);
+            if (i > -1) list.splice(i, 1);
+            interceptor = null;
+        }
+
+        if (pasteHandler) {
+            document.removeEventListener("paste", pasteHandler, true);
+            pasteHandler = null;
+        }
+        if (dropHandler) {
+            document.removeEventListener("drop", dropHandler, true);
+            dropHandler = null;
+        }
     }
 });
